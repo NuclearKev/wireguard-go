@@ -113,6 +113,9 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
 	return peer, nil
 }
 
+// SendBuffers sends buffers to peer. WireGuard packet data in each element of
+// buffers must be preceded by MessageEncapsulatingTransportSize number of
+// bytes.
 func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	peer.device.net.RLock()
 	defer peer.device.net.RUnlock()
@@ -133,7 +136,7 @@ func (peer *Peer) SendBuffers(buffers [][]byte) error {
 	}
 	peer.endpoint.Unlock()
 
-	err := peer.device.net.bind.Send(buffers, endpoint)
+	err := peer.device.net.bind.Send(buffers, endpoint, MessageEncapsulatingTransportSize)
 	if err == nil {
 		var totalLen uint64
 		for _, b := range buffers {
@@ -279,13 +282,14 @@ func (peer *Peer) Stop() {
 func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
 	peer.endpoint.Lock()
 	defer peer.endpoint.Unlock()
+	if ep, ok := endpoint.(conn.PeerAwareEndpoint); ok {
+		ep.FromPeer(peer.handshake.remoteStatic)
+		return
+	}
 	if peer.endpoint.disableRoaming {
 		return
 	}
 	peer.endpoint.clearSrcOnTx = false
-	if ep, ok := endpoint.(conn.PeerAwareEndpoint); ok {
-		endpoint = ep.GetPeerEndpoint(peer.handshake.remoteStatic)
-	}
 	peer.endpoint.val = endpoint
 }
 
