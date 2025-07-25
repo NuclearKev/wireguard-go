@@ -61,7 +61,7 @@ func init() {
 		// Attempt to enable UDP_GRO
 		func(network, address string, c syscall.RawConn) error {
 			c.Control(func(fd uintptr) {
-				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, unix.UDP_GRO, 1)
+				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_UDP, socketOptionUDPGRO, 1)
 			})
 			return nil
 		},
