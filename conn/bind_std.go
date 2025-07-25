@@ -181,11 +181,7 @@ again:
 	var fns []ReceiveFunc
 	if v4conn != nil {
 		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
-<<<<<<< HEAD
-		if runtime.GOOS == "linux" {
-=======
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
->>>>>>> upstream/master
 			v4pc = ipv4.NewPacketConn(v4conn)
 			s.ipv4PC = v4pc
 		}
@@ -194,11 +190,7 @@ again:
 	}
 	if v6conn != nil {
 		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
-<<<<<<< HEAD
-		if runtime.GOOS == "linux" {
-=======
 		if runtime.GOOS == "linux" || runtime.GOOS == "android" {
->>>>>>> upstream/master
 			v6pc = ipv6.NewPacketConn(v6conn)
 			s.ipv6PC = v6pc
 		}
@@ -214,10 +206,7 @@ again:
 
 func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
 	for i := range *msgs {
-<<<<<<< HEAD
-=======
 		(*msgs)[i].OOB = (*msgs)[i].OOB[:0]
->>>>>>> upstream/master
 		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers, OOB: (*msgs)[i].OOB}
 	}
 	s.msgsPool.Put(msgs)
@@ -255,15 +244,9 @@ func (s *StdNetBind) receiveIP(
 	}
 	defer s.putMessages(msgs)
 	var numMsgs int
-<<<<<<< HEAD
-	if runtime.GOOS == "linux" {
-		if rxOffload {
-			readAt := len(*msgs) - 2
-=======
 	if runtime.GOOS == "linux" || runtime.GOOS == "android" {
 		if rxOffload {
 			readAt := len(*msgs) - (IdealBatchSize / udpSegmentMaxDatagrams)
->>>>>>> upstream/master
 			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
 			if err != nil {
 				return 0, err
@@ -361,11 +344,7 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 	return e.RetryErr
 }
 
-<<<<<<< HEAD
-func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
-=======
 func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
->>>>>>> upstream/master
 	s.mu.Lock()
 	blackhole := s.blackhole4
 	conn := s.ipv4
@@ -408,11 +387,7 @@ func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint) error {
 	)
 retry:
 	if offload {
-<<<<<<< HEAD
-		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, offset, *msgs, setGSOSize)
-=======
 		n := coalesceMessages(ua, endpoint.(*StdNetEndpoint), bufs, *msgs, setGSOSize)
->>>>>>> upstream/master
 		err = s.send(conn, br, (*msgs)[:n])
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
@@ -429,11 +404,7 @@ retry:
 	} else {
 		for i := range bufs {
 			(*msgs)[i].Addr = ua
-<<<<<<< HEAD
-			(*msgs)[i].Buffers[0] = bufs[i][offset:]
-=======
 			(*msgs)[i].Buffers[0] = bufs[i]
->>>>>>> upstream/master
 			setSrcControl(&(*msgs)[i].OOB, endpoint.(*StdNetEndpoint))
 		}
 		err = s.send(conn, br, (*msgs)[:len(bufs)])
@@ -482,11 +453,7 @@ const (
 
 type setGSOFunc func(control *[]byte, gsoSize uint16)
 
-<<<<<<< HEAD
-func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, offset int, msgs []ipv6.Message, setGSO setGSOFunc) int {
-=======
 func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs []ipv6.Message, setGSO setGSOFunc) int {
->>>>>>> upstream/master
 	var (
 		base     = -1 // index of msg we are currently coalescing into
 		gsoSize  int  // segmentation size of msgs[base]
@@ -498,10 +465,6 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, msgs
 		maxPayloadLen = maxIPv6PayloadLen
 	}
 	for i, buf := range bufs {
-<<<<<<< HEAD
-		buf = buf[offset:]
-=======
->>>>>>> upstream/master
 		if i > 0 {
 			msgLen := len(buf)
 			baseLenBefore := len(msgs[base].Buffers[0])
