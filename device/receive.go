@@ -440,11 +440,7 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 		if elemsContainer == nil {
 			return
 		}
-		elemsContainer.Lock()
-		validTailPacket := -1
-		dataPacketReceived := false
-		rxBytesLen := uint64(0)
-		for i, elem := range elemsContainer.elems {
+		for _, elem := range elemsContainer.elems {
 			if elem.packet == nil {
 				// decryption failed
 				continue
