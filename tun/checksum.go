@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"math/bits"
 	"strconv"
+)
 
 // TODO: Explore SIMD and/or other assembly optimizations.
 // TODO: Test native endian loads. See RFC 1071 section 2 part B.
