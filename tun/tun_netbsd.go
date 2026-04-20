@@ -25,7 +25,12 @@ type ifreq_mtu struct {
 	Pad0 [12]byte
 }
 
-const _TUNSIFHEAD = 0x80047442
+// Structure for iface flag get/set ioctls
+type ifreq_flags struct {
+	Name  [unix.IFNAMSIZ]byte
+	Flags uint16
+	Pad0  [14]byte
+}
 
 type NativeTun struct {
 	name        string
@@ -128,23 +133,17 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	tun, err := CreateTUNFromFile(tunfile, mtu)
-
-	// set multi-af mode
-	ifheadmode := 1
-	var errno syscall.Errno
-	_, _, errno = unix.Syscall(
-		unix.SYS_IOCTL,
-		tunfile.Fd(),
-		uintptr(_TUNSIFHEAD),
-		uintptr(unsafe.Pointer(&ifheadmode)),
-	)
-
-	if errno != 0 {
+	// Enable multi-AF mode via IFF_LINK0 BEFORE creating the TUN device.
+	// NetBSD's tun(4) uses IFF_LINK0 to prepend a 4-byte address family
+	// header to each packet. This must be set before any reads occur,
+	// as Read/Write expect the 4-byte AF prefix.
+	ifName := fmt.Sprintf("tun%d", ifIndex)
+	if err := setLink0(ifName); err != nil {
 		tunfile.Close()
-		return nil, fmt.Errorf("Unable to put into multi-af mode: %v", errno)
+		return nil, fmt.Errorf("failed to enable multi-af mode (link0): %w", err)
 	}
 
+	tun, err := CreateTUNFromFile(tunfile, mtu)
 
 	if err == nil && name == "tun" {
 		fname := os.Getenv("WG_TUN_NAME_FILE")
@@ -154,6 +153,45 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	return tun, err
+}
+
+// setLink0 enables IFF_LINK0 on the named interface, which puts NetBSD's
+// tun(4) device into multi-AF mode (each packet gets a 4-byte AF header).
+func setLink0(ifName string) error {
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+
+	var ifr ifreq_flags
+	copy(ifr.Name[:], ifName)
+
+	// Get current flags
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(unix.SIOCGIFFLAGS),
+		uintptr(unsafe.Pointer(&ifr)),
+	)
+	if errno != 0 {
+		return fmt.Errorf("SIOCGIFFLAGS: %v", errno)
+	}
+
+	// Set IFF_LINK0 for multi-AF mode
+	ifr.Flags |= unix.IFF_LINK0
+
+	_, _, errno = unix.Syscall(
+		unix.SYS_IOCTL,
+		uintptr(fd),
+		uintptr(unix.SIOCSIFFLAGS),
+		uintptr(unsafe.Pointer(&ifr)),
+	)
+	if errno != 0 {
+		return fmt.Errorf("SIOCSIFFLAGS: %v", errno)
+	}
+
+	return nil
 }
 
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
@@ -227,11 +265,20 @@ func (tun *NativeTun) Read(bufs [][]byte, sizes []int, offset int) (int, error) 
 	default:
 		buf := bufs[0][offset-4:]
 		n, err := tun.tunFile.Read(buf[:])
-		if n < 4 {
+		if err != nil {
+			// NetBSD returns EHOSTDOWN when reading from a TUN device
+			// that has no addresses configured yet. This is transient —
+			// once the router assigns addresses, reads will succeed.
+			if errors.Is(err, syscall.EHOSTDOWN) {
+				return 0, nil
+			}
 			return 0, err
 		}
+		if n < 4 {
+			return 0, nil
+		}
 		sizes[0] = n - 4
-		return 1, err
+		return 1, nil
 	}
 }
 
