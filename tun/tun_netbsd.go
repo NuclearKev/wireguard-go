@@ -25,12 +25,7 @@ type ifreq_mtu struct {
 	Pad0 [12]byte
 }
 
-// Structure for iface flag get/set ioctls
-type ifreq_flags struct {
-	Name  [unix.IFNAMSIZ]byte
-	Flags uint16
-	Pad0  [14]byte
-}
+const _TUNSIFHEAD = 0x80047442
 
 type NativeTun struct {
 	name        string
@@ -133,14 +128,19 @@ func CreateTUN(name string, mtu int) (Device, error) {
 		return nil, err
 	}
 
-	// Enable multi-AF mode via IFF_LINK0 BEFORE creating the TUN device.
-	// NetBSD's tun(4) uses IFF_LINK0 to prepend a 4-byte address family
-	// header to each packet. This must be set before any reads occur,
-	// as Read/Write expect the 4-byte AF prefix.
-	ifName := fmt.Sprintf("tun%d", ifIndex)
-	if err := setLink0(ifName); err != nil {
+	// Enable multi-AF mode via TUNSIFHEAD BEFORE creating the TUN device.
+	// This prepends a 4-byte address family header to each packet,
+	// which Read/Write expect. Must be set before any reads occur.
+	ifheadmode := 1
+	_, _, errno := unix.Syscall(
+		unix.SYS_IOCTL,
+		tunfile.Fd(),
+		uintptr(_TUNSIFHEAD),
+		uintptr(unsafe.Pointer(&ifheadmode)),
+	)
+	if errno != 0 {
 		tunfile.Close()
-		return nil, fmt.Errorf("failed to enable multi-af mode (link0): %w", err)
+		return nil, fmt.Errorf("failed to enable multi-af mode (TUNSIFHEAD): %v", errno)
 	}
 
 	tun, err := CreateTUNFromFile(tunfile, mtu)
@@ -153,45 +153,6 @@ func CreateTUN(name string, mtu int) (Device, error) {
 	}
 
 	return tun, err
-}
-
-// setLink0 enables IFF_LINK0 on the named interface, which puts NetBSD's
-// tun(4) device into multi-AF mode (each packet gets a 4-byte AF header).
-func setLink0(ifName string) error {
-	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(fd)
-
-	var ifr ifreq_flags
-	copy(ifr.Name[:], ifName)
-
-	// Get current flags
-	_, _, errno := unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(unix.SIOCGIFFLAGS),
-		uintptr(unsafe.Pointer(&ifr)),
-	)
-	if errno != 0 {
-		return fmt.Errorf("SIOCGIFFLAGS: %v", errno)
-	}
-
-	// Set IFF_LINK0 for multi-AF mode
-	ifr.Flags |= unix.IFF_LINK0
-
-	_, _, errno = unix.Syscall(
-		unix.SYS_IOCTL,
-		uintptr(fd),
-		uintptr(unix.SIOCSIFFLAGS),
-		uintptr(unsafe.Pointer(&ifr)),
-	)
-	if errno != 0 {
-		return fmt.Errorf("SIOCSIFFLAGS: %v", errno)
-	}
-
-	return nil
 }
 
 func CreateTUNFromFile(file *os.File, mtu int) (Device, error) {
