@@ -249,6 +249,9 @@ func (tun *NativeTun) Write(bufs [][]byte, offset int) (int, error) {
 	}
 	for i, buf := range bufs {
 		buf = buf[offset-4:]
+		if len(buf) < 5 {
+			return i, io.ErrShortBuffer
+		}
 		buf[0] = 0x00
 		buf[1] = 0x00
 		buf[2] = 0x00
