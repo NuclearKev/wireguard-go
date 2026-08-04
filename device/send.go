@@ -106,6 +106,69 @@ func (peer *Peer) SendKeepalive() {
 	peer.SendStagedPackets()
 }
 
+// SendPriorityMessage invokes the [PeerPriorityMessageFunc] callback if one is
+// set, and queues the returned message for encryption and transmission if the
+// current keypair is valid.
+func (peer *Peer) SendPriorityMessage() {
+	f := peer.device.priorityMsgFn.Load()
+	if f == nil {
+		return
+	}
+	keypair := peer.keypairs.Current()
+	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
+		// SendStagedPackets initializes a handshake when the keypair is invalid,
+		// but we explicitly avoid that here. A priority message is only intended
+		// to flow around symmetric session establishment, but it should never
+		// trigger a new session. Reaching this branch due to nonce exhaustion
+		// or keypair expiration is highly unlikely considering where
+		// SendPriorityMessage is called (at current keypair establishment).
+		return
+	}
+
+	// get plaintext message to send
+	msg := (*f)(peer.handshake.remoteStatic)
+	if len(msg) == 0 {
+		return
+	}
+	if len(msg) > MaxPriorityMessageContentSize {
+		peer.device.log.Verbosef("%v - Failed to queue priority message due to size", peer)
+		return
+	}
+
+	// get pooled elements
+	elem := peer.device.NewOutboundElement()
+	elemsContainer := peer.device.GetOutboundElementsContainer()
+	elemsContainer.elems = append(elemsContainer.elems, elem)
+	packetQueued := false
+	defer func() {
+		if !packetQueued {
+			peer.device.PutMessageBuffer(elem.buffer)
+			peer.device.PutOutboundElement(elem)
+			peer.device.PutOutboundElementsContainer(elemsContainer)
+		}
+	}()
+
+	// initialize outbound element
+	const offset = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
+	n := copy(elem.buffer[offset:], msg)
+	elem.packet = elem.buffer[offset : offset+n]
+	elem.peer = peer
+	elem.nonce = keypair.sendNonce.Add(1) - 1
+	if elem.nonce >= RejectAfterMessages {
+		keypair.sendNonce.Store(RejectAfterMessages)
+		return
+	}
+	elem.keypair = keypair
+
+	// add to parallel and sequential queue
+	if peer.isRunning.Load() {
+		elemsContainer.filling.Add(1)
+		peer.queue.outbound.c <- elemsContainer
+		peer.device.queue.encryption.c <- elemsContainer
+		packetQueued = true
+	}
+}
+
 func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 	if !isRetry {
 		peer.timers.handshakeAttempts.Store(0)
@@ -123,6 +186,10 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
 		peer.handshake.mutex.Unlock()
 		return nil
 	}
+	// handshakeOnUserSend is flipped false after lastSentHandshake checks,
+	// enabling eventual transmission at a future call of this method, while
+	// still honoring [RekeyTimeout].
+	peer.handshakeOnUserSend.Store(false)
 	peer.handshake.lastSentHandshake = time.Now()
 	peer.handshake.mutex.Unlock()
 
@@ -211,8 +278,9 @@ func (peer *Peer) keepKeyFreshSending() {
 	if keypair == nil {
 		return
 	}
+	txHandshake := peer.handshakeOnUserSend.Load()
 	nonce := keypair.sendNonce.Load()
-	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
+	if txHandshake || nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
 		peer.SendHandshakeInitiation(false)
 	}
 }
