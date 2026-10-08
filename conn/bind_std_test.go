@@ -2,7 +2,12 @@ package conn
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"net"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/ipv6"
@@ -15,15 +20,125 @@ func TestStdNetBindReceiveFuncAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	bind.Close()
-	bufs := make([][]byte, 1)
-	bufs[0] = make([]byte, 1)
-	sizes := make([]int, 1)
-	eps := make([]Endpoint, 1)
+	slab := make([]byte, 1)
+	packets := make([]ReceivedPacket, 1)
 	for _, fn := range fns {
 		// The ReceiveFuncs must not access conn-related fields on StdNetBind
 		// unguarded. Close() nils the conn-related fields resulting in a panic
 		// if they violate the mutex.
-		fn(bufs, sizes, eps)
+		fn(slab, packets)
+	}
+}
+
+func TestSocketName(t *testing.T) {
+	tests := []struct {
+		family   string
+		i, total int
+		want     string
+	}{
+		{"v4", 0, 1, "v4"},
+		{"v6", 0, 1, "v6"},
+		{"v4", 0, 4, "v4:0"},
+		{"v4", 3, 4, "v4:3"},
+		{"v6", 3, 4, "v6:3"},
+	}
+	for _, tt := range tests {
+		if got := socketName(tt.family, tt.i, tt.total); got != tt.want {
+			t.Errorf("socketName(%q, %d, %d) = %q, want %q",
+				tt.family, tt.i, tt.total, got, tt.want)
+		}
+	}
+}
+
+func TestStdNetBindNames(t *testing.T) {
+	want := func(bind *StdNetBind) []string {
+		var names []string
+		for i := range bind.v4 {
+			names = append(names, socketName("v4", i, len(bind.v4)))
+		}
+		for i := range bind.v6 {
+			names = append(names, socketName("v6", i, len(bind.v6)))
+		}
+		return names
+	}
+
+	for _, sockets := range []int{1, 4} {
+		t.Run(fmt.Sprintf("sockets=%d", sockets), func(t *testing.T) {
+			bind := NewStdNetBind(WithSockets(sockets)).(*StdNetBind)
+			fns, _, err := bind.Open(0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer bind.Close()
+
+			names := bind.ReceiveNames()
+			if len(names) != len(fns) {
+				t.Fatalf("len(Names()) = %d, len(fns) = %d", len(names), len(fns))
+			}
+			if got := want(bind); !slices.Equal(names, got) {
+				t.Errorf("ReceiveNames() = %q, want %q", names, got)
+			}
+			wantMulti := sockets > 1 && reusePortFn != nil
+			if gotMulti := len(bind.v4) > 1; gotMulti != wantMulti {
+				t.Errorf("len(v4) = %d, want %d sockets", len(bind.v4), sockets)
+			}
+			if wantMulti && !slices.Contains(names, "v4:3") {
+				t.Errorf("ReceiveNames() = %q, want it to contain v4:3", names)
+			}
+			if len(slices.Compact(slices.Clone(names))) != len(names) {
+				t.Errorf("ReceiveNames() = %q, want all distinct", names)
+			}
+			if got := NamesOf(bind, fns); !slices.Equal(got, names) {
+				t.Errorf("ReceiveNamesOf() = %q, want %q", got, names)
+			}
+		})
+	}
+}
+
+func TestStdNetBindNamesAfterClose(t *testing.T) {
+	bind := NewStdNetBind().(*StdNetBind)
+	fns, _, err := bind.Open(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bind.Close()
+	if names := bind.ReceiveNames(); len(names) != 0 {
+		t.Errorf("ReceiveNames() after Close = %q, want empty", names)
+	}
+	for i, name := range NamesOf(bind, fns) {
+		if want := strconv.Itoa(i) + "/"; !strings.HasPrefix(name, want) {
+			t.Errorf("ReceiveNamesOf()[%d] = %q, want prefix %q", i, name, want)
+		}
+	}
+}
+
+// openMultiSocketBind returns a bind with n v4 sockets, skipping the test if
+// this platform cannot supply them.
+func openMultiSocketBind(t *testing.T, n int) *StdNetBind {
+	t.Helper()
+	if reusePortFn == nil {
+		t.Skip("no SO_REUSEPORT on this platform")
+	}
+	bind := NewStdNetBind(WithSockets(n)).(*StdNetBind)
+	if _, _, err := bind.Open(0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { bind.Close() })
+	if len(bind.v4) != n {
+		t.Fatalf("len(v4) = %d, want %d", len(bind.v4), n)
+	}
+	return bind
+}
+
+func TestStdNetBindOpenRefusesExistingGroup(t *testing.T) {
+	held := openMultiSocketBind(t, 2)
+	defer held.Close()
+	port := held.v4[0].conn.LocalAddr().(*net.UDPAddr).Port
+
+	bind := NewStdNetBind(WithSockets(2))
+	if _, _, err := bind.Open(uint16(port)); !errors.Is(err, errEADDRINUSE) {
+		bind.Close()
+		t.Fatalf("Open() on a held port = %v, want EADDRINUSE", err)
 	}
 }
 
@@ -136,12 +251,13 @@ func mockGetGSOSize(control []byte) (int, error) {
 	return int(binary.LittleEndian.Uint16(control)), nil
 }
 
-func Test_splitCoalescedMessages(t *testing.T) {
+func Test_fillReceivedPackets(t *testing.T) {
 	newMsg := func(n, gso int) ipv6.Message {
 		msg := ipv6.Message{
-			Buffers: [][]byte{make([]byte, 1<<16-1)},
+			Buffers: [][]byte{make([]byte, maxDatagramSize)},
 			N:       n,
 			OOB:     make([]byte, 2),
+			Addr:    &net.UDPAddr{},
 		}
 		binary.LittleEndian.PutUint16(msg.OOB, uint16(gso))
 		if gso > 0 {
@@ -153,103 +269,120 @@ func Test_splitCoalescedMessages(t *testing.T) {
 	cases := []struct {
 		name        string
 		msgs        []ipv6.Message
-		firstMsgAt  int
 		wantNumEval int
-		wantMsgLens []int
+		wantPackets [][2]int // {offset, size}
 		wantErr     bool
 	}{
 		{
-			name: "second last split last empty",
+			name: "first split",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(3, 1),
-				newMsg(0, 0),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 3,
-			wantMsgLens: []int{1, 1, 1, 0},
-			wantErr:     false,
+			wantPackets: [][2]int{
+				{0, 1},
+				{1, 1},
+				{2, 1},
+			},
+			wantErr: false,
 		},
 		{
-			name: "second last no split last empty",
+			name: "first no split",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(1, 0),
-				newMsg(0, 0),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 1,
-			wantMsgLens: []int{1, 0, 0, 0},
-			wantErr:     false,
+			wantPackets: [][2]int{
+				{0, 1},
+			},
+			wantErr: false,
 		},
 		{
-			name: "second last no split last no split",
+			name: "first no split last no split",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(1, 0),
 				newMsg(1, 0),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 2,
-			wantMsgLens: []int{1, 1, 0, 0},
-			wantErr:     false,
+			wantPackets: [][2]int{
+				{0, 1},
+				{maxDatagramSize, 1},
+			},
+			wantErr: false,
 		},
 		{
-			name: "second last no split last split",
+			name: "first no split last split",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(1, 0),
 				newMsg(3, 1),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     false,
+			wantPackets: [][2]int{
+				{0, 1},
+				{maxDatagramSize, 1},
+				{maxDatagramSize + 1, 1},
+				{maxDatagramSize + 2, 1},
+			},
+			wantErr: false,
 		},
 		{
-			name: "second last split last split",
+			name: "first split last split",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(2, 1),
 				newMsg(2, 1),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     false,
+			wantPackets: [][2]int{
+				{0, 1},
+				{1, 1},
+				{maxDatagramSize, 1},
+				{maxDatagramSize + 1, 1},
+			},
+			wantErr: false,
 		},
 		{
-			name: "second last no split last split overflow",
+			name: "first no split last split overflow",
 			msgs: []ipv6.Message{
-				newMsg(0, 0),
-				newMsg(0, 0),
 				newMsg(1, 0),
 				newMsg(4, 1),
 			},
-			firstMsgAt:  2,
 			wantNumEval: 4,
-			wantMsgLens: []int{1, 1, 1, 1},
-			wantErr:     true,
+			wantPackets: [][2]int{
+				{0, 1},
+				{maxDatagramSize, 1},
+				{maxDatagramSize + 1, 1},
+				{maxDatagramSize + 2, 1},
+			},
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := splitCoalescedMessages(tt.msgs, 2, mockGetGSOSize)
-			if err != nil && !tt.wantErr {
+			packets := make([]ReceivedPacket, len(tt.wantPackets))
+			got, err := fillReceivedPackets(
+				tt.msgs,
+				1<<16-1,
+				packets,
+				true,
+				mockGetGSOSize,
+			)
+			if (err != nil) != tt.wantErr {
 				t.Fatalf("err: %v", err)
 			}
 			if got != tt.wantNumEval {
 				t.Fatalf("got to eval: %d want: %d", got, tt.wantNumEval)
 			}
-			for i, msg := range tt.msgs {
-				if msg.N != tt.wantMsgLens[i] {
-					t.Fatalf("msg[%d].N: %d want: %d", i, msg.N, tt.wantMsgLens[i])
+			if len(packets) != len(tt.wantPackets) {
+				t.Fatalf("got %d packets, want %d", len(packets), len(tt.wantPackets))
+			}
+			for i, want := range tt.wantPackets {
+				got := packets[i]
+				if got.Offset != want[0] || got.Size != want[1] {
+					t.Errorf(
+						"packets[%d] = {Offset: %d, Size: %d}, want {Offset: %d, Size: %d}",
+						i, got.Offset, got.Size, want[0], want[1],
+					)
 				}
 			}
 		})

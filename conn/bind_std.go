@@ -9,11 +9,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"golang.org/x/net/ipv4"
@@ -21,8 +23,10 @@ import (
 )
 
 var (
-	_ Bind     = (*StdNetBind)(nil)
-	_ Endpoint = (*StdNetEndpoint)(nil)
+	_ Bind            = (*StdNetBind)(nil)
+	_ NamedBind       = (*StdNetBind)(nil)
+	_ MultiSocketBind = (*StdNetBind)(nil)
+	_ Endpoint        = (*StdNetEndpoint)(nil)
 )
 
 // StdNetBind implements Bind for all platforms. While Windows has its own Bind
@@ -31,26 +35,50 @@ var (
 // methods for sending and receiving multiple datagrams per-syscall. See the
 // proposal in https://github.com/golang/go/issues/45886#issuecomment-1218301564.
 type StdNetBind struct {
-	mu            sync.Mutex // protects all fields except as specified
-	ipv4          *net.UDPConn
-	ipv6          *net.UDPConn
-	ipv4PC        *ipv4.PacketConn // will be nil on non-Linux
-	ipv6PC        *ipv6.PacketConn // will be nil on non-Linux
-	ipv4TxOffload bool
-	ipv4RxOffload bool
-	ipv6TxOffload bool
-	ipv6RxOffload bool
+	config config // read-only post construction.
+
+	mu sync.Mutex // protects all fields except as specified
+
+	// v4 and v6 are fixed in size between Open and Close.
+	// Close nils the fields, but member references remain valid.
+	v4 []*stdNetSocket
+	v6 []*stdNetSocket
 
 	// these two fields are not guarded by mu
 	udpAddrPool sync.Pool
-	msgsPool    sync.Pool
+	messagePool messagePool // shared by every [stdNetSocket]s
 
 	blackhole4 bool
 	blackhole6 bool
 }
 
-func NewStdNetBind() Bind {
-	return &StdNetBind{
+// stdNetSocket is one UDP socket. See [WithSockets].
+type stdNetSocket struct {
+	conn *net.UDPConn
+	// messagePool is the owning [StdNetBind]'s messagePool
+	messagePool *messagePool
+	// pc is the batched read/write view of conn, the intersection of
+	// ipv4.PacketConn and ipv6.PacketConn. It is nil on non-Linux.
+	pc interface {
+		batchReader
+		batchWriter
+	}
+
+	txOffload atomic.Bool // shared by concurrent [MultiSocketBind.SendTo] calls
+	rxOffload bool
+}
+
+func (s *StdNetBind) newSocket(c *net.UDPConn) *stdNetSocket {
+	sock := &stdNetSocket{conn: c, messagePool: &s.messagePool}
+	tx, rx := supportsUDPOffload(c)
+	sock.txOffload.Store(tx)
+	sock.rxOffload = rx
+	return sock
+}
+
+func NewStdNetBind(opts ...Option) Bind {
+	b := &StdNetBind{
+		config: defaultConfig(),
 		udpAddrPool: sync.Pool{
 			New: func() any {
 				return &net.UDPAddr{
@@ -59,17 +87,23 @@ func NewStdNetBind() Bind {
 			},
 		},
 
-		msgsPool: sync.Pool{
-			New: func() any {
-				msgs := make([]ipv6.Message, IdealBatchSize)
-				for i := range msgs {
-					msgs[i].Buffers = make(net.Buffers, 1)
-					msgs[i].OOB = make([]byte, controlSize)
-				}
-				return &msgs
+		messagePool: messagePool{
+			pool: sync.Pool{
+				New: func() any {
+					msgs := make([]ipv6.Message, IdealBatchSize)
+					for i := range msgs {
+						msgs[i].Buffers = make(net.Buffers, 1)
+						msgs[i].OOB = make([]byte, controlSize)
+					}
+					return &msgs
+				},
 			},
 		},
 	}
+	for _, opt := range opts {
+		opt.apply(&b.config)
+	}
+	return b
 }
 
 type StdNetEndpoint struct {
@@ -80,11 +114,6 @@ type StdNetEndpoint struct {
 	// messages, see unix.PKTINFO for an example.
 	src []byte
 }
-
-var (
-	_ Bind     = (*StdNetBind)(nil)
-	_ Endpoint = &StdNetEndpoint{}
-)
 
 func (*StdNetBind) ParseEndpoint(s string) (Endpoint, error) {
 	e, err := netip.ParseAddrPort(s)
@@ -118,8 +147,8 @@ func (e *StdNetEndpoint) DstToString() string {
 	return e.AddrPort.String()
 }
 
-func listenNet(network string, port int) (*net.UDPConn, int, error) {
-	conn, err := listenConfig().ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
+func listenNet(network string, port int, ctrl ...controlFn) (*net.UDPConn, int, error) {
+	conn, err := listenConfig(ctrl...).ListenPacket(context.Background(), network, ":"+strconv.Itoa(port))
 	if err != nil {
 		return nil, 0, err
 	}
@@ -141,6 +170,57 @@ func listenNet(network string, port int) (*net.UDPConn, int, error) {
 // it's at least non-nil.
 var errEADDRINUSE error = errors.New("")
 
+// bindGroup opens n [net.UDPConn]s sharing one local port, via SO_REUSEPORT
+// when n is more than one. If port is 0, all sockets join the same ephemeral
+// port. The returned group is either empty or the full n.
+func bindGroup(network string, port, n int) ([]*net.UDPConn, int, error) {
+	var conns []*net.UDPConn
+	for i := range n {
+		// UDP on Linux guards against the ephemeral port reuse across different
+		// users, but not two groups across different PIDs:
+		// https://elixir.bootlin.com/linux/v7.0/source/net/ipv4/udp.c#L141
+		//
+		// TCP had the same fixed in 2016: torvalds/linux@0643ee4.
+		// The UDP fix (torvalds/linux@20d020a07536, plus selftests in
+		// @883c308be425) is queued in net-next for v7.4:
+		// https://patch.msgid.link/20260928023145.301855-1-jiayuan.chen@linux.dev
+		//
+		// For now, bind first socket without SO_REUSEPORT, then apply
+		// the option if successful.
+		var ctrl []controlFn
+		if i > 0 {
+			ctrl = []controlFn{reusePortFn}
+		}
+		c, p, err := listenNet(network, port, ctrl...)
+		if err != nil {
+			closeConns(conns)
+			return nil, 0, err
+		}
+		if n > 1 && i == 0 {
+			if err := reusePortAfterBind(network, c); err != nil {
+				c.Close()
+				return nil, 0, err
+			}
+		}
+		conns, port = append(conns, c), p
+	}
+	return conns, port, nil
+}
+
+func reusePortAfterBind(network string, c *net.UDPConn) error {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return reusePortFn(network, "", rc)
+}
+
+func closeConns(conns []*net.UDPConn) {
+	for _, c := range conns {
+		c.Close()
+	}
+}
+
 func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -148,52 +228,58 @@ func (s *StdNetBind) Open(uport uint16) ([]ReceiveFunc, uint16, error) {
 	var err error
 	var tries int
 
-	if s.ipv4 != nil || s.ipv6 != nil {
+	if len(s.v4) > 0 || len(s.v6) > 0 {
 		return nil, 0, ErrBindAlreadyOpen
+	}
+
+	if s.config.sockets < 1 {
+		return nil, 0, fmt.Errorf("%d bind sockets requested, must be at least 1", s.config.sockets)
+	}
+	// Allow more than one socket only if reusePort is implemented.
+	ns := 1
+	if reusePortFn != nil {
+		ns = s.config.sockets
 	}
 
 	// Attempt to open ipv4 and ipv6 listeners on the same port.
 	// If uport is 0, we can retry on failure.
 again:
 	port := int(uport)
-	var v4conn, v6conn *net.UDPConn
-	var v4pc *ipv4.PacketConn
-	var v6pc *ipv6.PacketConn
+	var v4conns, v6conns []*net.UDPConn
 
-	v4conn, port, err = listenNet("udp4", port)
+	v4conns, port, err = bindGroup("udp4", port, ns)
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
 		return nil, 0, err
 	}
 
 	// Listen on the same port as we're using for ipv4.
-	v6conn, port, err = listenNet("udp6", port)
+	v6conns, port, err = bindGroup("udp6", port, ns)
 	if uport == 0 && errors.Is(err, errEADDRINUSE) && tries < 100 {
-		v4conn.Close()
+		closeConns(v4conns)
 		tries++
 		goto again
 	}
 	if err != nil && !errors.Is(err, syscall.EAFNOSUPPORT) {
-		v4conn.Close()
+		closeConns(v4conns)
 		return nil, 0, err
 	}
+
 	var fns []ReceiveFunc
-	if v4conn != nil {
-		s.ipv4TxOffload, s.ipv4RxOffload = supportsUDPOffload(v4conn)
+	for _, c := range v4conns {
+		sock := s.newSocket(c)
 		if runtime.GOOS == "linux" {
-			v4pc = ipv4.NewPacketConn(v4conn)
-			s.ipv4PC = v4pc
+			sock.pc = ipv4.NewPacketConn(c)
 		}
-		fns = append(fns, s.makeReceiveIPv4(v4pc, v4conn, s.ipv4RxOffload))
-		s.ipv4 = v4conn
+		fns = append(fns, sock.receiveIP)
+		s.v4 = append(s.v4, sock)
 	}
-	if v6conn != nil {
-		s.ipv6TxOffload, s.ipv6RxOffload = supportsUDPOffload(v6conn)
+	for _, c := range v6conns {
+		sock := s.newSocket(c)
 		if runtime.GOOS == "linux" {
-			v6pc = ipv6.NewPacketConn(v6conn)
-			s.ipv6PC = v6pc
+			sock.pc = ipv6.NewPacketConn(c)
 		}
-		fns = append(fns, s.makeReceiveIPv6(v6pc, v6conn, s.ipv6RxOffload))
-		s.ipv6 = v6conn
+		fns = append(fns, sock.receiveIP)
+		s.v6 = append(s.v6, sock)
 	}
 	if len(fns) == 0 {
 		return nil, 0, syscall.EAFNOSUPPORT
@@ -202,18 +288,29 @@ again:
 	return fns, uint16(port), nil
 }
 
-func (s *StdNetBind) putMessages(msgs *[]ipv6.Message) {
-	for i := range *msgs {
-		// Non coalesced write paths access only batch.msgs[i].Buffers[0],
-		// but we append more during [coalesceMessages].
-		// Leave index zero accessible:
-		(*msgs)[i] = ipv6.Message{Buffers: (*msgs)[i].Buffers[:1], OOB: (*msgs)[i].OOB}
-	}
-	s.msgsPool.Put(msgs)
+// messagePool recycles the [ipv6.Message] batches that the read and write
+// paths hand to the kernel. It is shared by every socket of a [StdNetBind].
+type messagePool struct {
+	pool sync.Pool
 }
 
-func (s *StdNetBind) getMessages() *[]ipv6.Message {
-	return s.msgsPool.Get().(*[]ipv6.Message)
+// putMessages resets each message in (*msgs)[:usedMsgs] for reuse, then returns
+// msgs to its [sync.Pool].
+func (p *messagePool) putMessages(msgs *[]ipv6.Message, usedMsgs int) {
+	for i := range (*msgs)[:usedMsgs] {
+		// Clear references to previously used packet buffers, otherwise they
+		// may never be GC'd.
+		clear((*msgs)[i].Buffers)
+		(*msgs)[i] = ipv6.Message{
+			Buffers: (*msgs)[i].Buffers[:1], // Non-coalesced write paths require a single element.
+			OOB:     (*msgs)[i].OOB,
+		}
+	}
+	p.pool.Put(msgs)
+}
+
+func (p *messagePool) getMessages() *[]ipv6.Message {
+	return p.pool.Get().(*[]ipv6.Message)
 }
 
 var (
@@ -229,70 +326,71 @@ type batchWriter interface {
 	WriteBatch([]ipv6.Message, int) (int, error)
 }
 
-func (s *StdNetBind) receiveIP(
-	br batchReader,
-	conn *net.UDPConn,
-	rxOffload bool,
-	bufs [][]byte,
-	sizes []int,
-	eps []Endpoint,
+const maxDatagramSize = 1<<16 - 1
+
+func (s *stdNetSocket) receiveIP(
+	slab []byte,
+	packets []ReceivedPacket,
 ) (n int, err error) {
-	msgs := s.getMessages()
-	for i := range bufs {
-		(*msgs)[i].Buffers[0] = bufs[i]
-		(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
+	msgs := s.messagePool.getMessages()
+	usedMsgs := 1
+	if runtime.GOOS == "linux" {
+		// set a floor of 1 in case len(slab) < maxDatagramSize
+		usedMsgs = max(1, len(slab)/maxDatagramSize)
+		// we can't read more datagrams than what we can describe in packets
+		usedMsgs = min(len(packets), usedMsgs)
 	}
-	defer s.putMessages(msgs)
+	defer s.messagePool.putMessages(msgs, usedMsgs)
 	var numMsgs int
 	if runtime.GOOS == "linux" {
-		if rxOffload {
-			readAt := len(*msgs) - 2
-			numMsgs, err = br.ReadBatch((*msgs)[readAt:], 0)
-			if err != nil {
-				return 0, err
+		rem := slab
+		for i := range usedMsgs {
+			end := maxDatagramSize
+			if len(rem) < maxDatagramSize {
+				end = len(rem)
 			}
-			numMsgs, err = splitCoalescedMessages(*msgs, readAt, getGSOSize)
-			if err != nil {
-				return 0, err
-			}
-		} else {
-			numMsgs, err = br.ReadBatch(*msgs, 0)
-			if err != nil {
-				return 0, err
-			}
+			(*msgs)[i].Buffers[0] = rem[:end]
+			(*msgs)[i].OOB = (*msgs)[i].OOB[:cap((*msgs)[i].OOB)]
+			rem = rem[end:]
+		}
+		numMsgs, err = s.pc.ReadBatch((*msgs)[:usedMsgs], 0)
+		if err != nil {
+			return 0, err
 		}
 	} else {
 		msg := &(*msgs)[0]
-		msg.N, msg.NN, _, msg.Addr, err = conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
+		msg.Buffers[0] = slab
+		msg.OOB = msg.OOB[:cap(msg.OOB)]
+		msg.N, msg.NN, _, msg.Addr, err = s.conn.ReadMsgUDP(msg.Buffers[0], msg.OOB)
 		if err != nil {
 			return 0, err
 		}
 		numMsgs = 1
 	}
-	for i := 0; i < numMsgs; i++ {
-		msg := &(*msgs)[i]
-		sizes[i] = msg.N
-		if sizes[i] == 0 {
-			continue
-		}
-		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
-		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
-		getSrcFromControl(msg.OOB[:msg.NN], ep)
-		eps[i] = ep
-	}
-	return numMsgs, nil
+	return fillReceivedPackets((*msgs)[:numMsgs], maxDatagramSize, packets, s.rxOffload, getGSOSize)
 }
 
-func (s *StdNetBind) makeReceiveIPv4(pc *ipv4.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
+func socketName(family string, i, total int) string {
+	if total == 1 {
+		return family
 	}
+	return family + ":" + strconv.Itoa(i)
 }
 
-func (s *StdNetBind) makeReceiveIPv6(pc *ipv6.PacketConn, conn *net.UDPConn, rxOffload bool) ReceiveFunc {
-	return func(bufs [][]byte, sizes []int, eps []Endpoint) (n int, err error) {
-		return s.receiveIP(pc, conn, rxOffload, bufs, sizes, eps)
+// ReceiveNames implements [NamedBind]. The order matches the [ReceiveFunc]s returned
+// by [StdNetBind.Open]: every v4 socket, then every v6 socket.
+func (s *StdNetBind) ReceiveNames() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	names := make([]string, 0, len(s.v4)+len(s.v6))
+	for i := range s.v4 {
+		names = append(names, socketName("v4", i, len(s.v4)))
 	}
+	for i := range s.v6 {
+		names = append(names, socketName("v6", i, len(s.v6)))
+	}
+	return names
 }
 
 // TODO: When all Binds handle IdealBatchSize, remove this dynamic function and
@@ -308,27 +406,18 @@ func (s *StdNetBind) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	var err1, err2 error
-	if s.ipv4 != nil {
-		err1 = s.ipv4.Close()
-		s.ipv4 = nil
-		s.ipv4PC = nil
+	var errs error
+	for _, sock := range s.v4 {
+		errs = errors.Join(errs, sock.conn.Close())
 	}
-	if s.ipv6 != nil {
-		err2 = s.ipv6.Close()
-		s.ipv6 = nil
-		s.ipv6PC = nil
+	for _, sock := range s.v6 {
+		errs = errors.Join(errs, sock.conn.Close())
 	}
+	s.v4 = nil
+	s.v6 = nil
 	s.blackhole4 = false
 	s.blackhole6 = false
-	s.ipv4TxOffload = false
-	s.ipv4RxOffload = false
-	s.ipv6TxOffload = false
-	s.ipv6RxOffload = false
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return errs
 }
 
 type ErrUDPGSODisabled struct {
@@ -345,30 +434,36 @@ func (e ErrUDPGSODisabled) Unwrap() error {
 }
 
 func (s *StdNetBind) Send(bufs [][]byte, endpoint Endpoint, offset int) error {
+	return s.SendTo(0, bufs, endpoint, offset)
+}
+
+func (s *StdNetBind) SendTo(flow int, bufs [][]byte, endpoint Endpoint, offset int) error {
+	// TODO: Investigate s.mu impact on performance, consider alternatives.
 	s.mu.Lock()
 	blackhole := s.blackhole4
-	conn := s.ipv4
-	offload := s.ipv4TxOffload
-	br := batchWriter(s.ipv4PC)
+	socks := s.v4
 	is6 := false
 	if endpoint.DstIP().Is6() {
 		blackhole = s.blackhole6
-		conn = s.ipv6
-		br = s.ipv6PC
+		socks = s.v6
 		is6 = true
-		offload = s.ipv6TxOffload
 	}
 	s.mu.Unlock()
 
 	if blackhole {
 		return nil
 	}
-	if conn == nil {
+	if len(socks) == 0 {
 		return syscall.EAFNOSUPPORT
 	}
+	sock := socks[uint(flow)%uint(len(socks))]
+	conn := sock.conn
+	br := sock.pc
+	offload := sock.txOffload.Load()
 
-	msgs := s.getMessages()
-	defer s.putMessages(msgs)
+	msgs := s.messagePool.getMessages()
+	usedMsgs := len(bufs)
+	defer s.messagePool.putMessages(msgs, usedMsgs)
 	ua := s.udpAddrPool.Get().(*net.UDPAddr)
 	defer s.udpAddrPool.Put(ua)
 	if is6 {
@@ -391,13 +486,12 @@ retry:
 		err = s.send(conn, br, (*msgs)[:n])
 		if err != nil && offload && errShouldDisableUDPGSO(err) {
 			offload = false
-			s.mu.Lock()
-			if is6 {
-				s.ipv6TxOffload = false
-			} else {
-				s.ipv4TxOffload = false
+			sock.txOffload.Store(false)
+			// Reset aggregation before retrying.
+			for i := range n {
+				clear((*msgs)[i].Buffers[1:])
+				(*msgs)[i].Buffers = (*msgs)[i].Buffers[:1]
 			}
-			s.mu.Unlock()
 			retried = true
 			goto retry
 		}
@@ -524,45 +618,41 @@ func coalesceMessages(addr *net.UDPAddr, ep *StdNetEndpoint, bufs [][]byte, offs
 
 type getGSOFunc func(control []byte) (int, error)
 
-func splitCoalescedMessages(msgs []ipv6.Message, firstMsgAt int, getGSO getGSOFunc) (n int, err error) {
-	for i := firstMsgAt; i < len(msgs); i++ {
-		msg := &msgs[i]
-		if msg.N == 0 {
-			return n, err
-		}
+func fillReceivedPackets(msgs []ipv6.Message, slabOffset int, packets []ReceivedPacket, rxOffload bool, getGSO getGSOFunc) (n int, err error) {
+	for i, msg := range msgs {
 		var (
 			gsoSize    int
 			start      int
-			end        = msg.N
 			numToSplit = 1
 		)
-		gsoSize, err = getGSO(msg.OOB[:msg.NN])
-		if err != nil {
-			return n, err
-		}
-		if gsoSize > 0 {
-			numToSplit = (msg.N + gsoSize - 1) / gsoSize
-			end = gsoSize
-		}
-		for j := 0; j < numToSplit; j++ {
-			if n > i {
-				return n, errors.New("splitting coalesced packet resulted in overflow")
+		if rxOffload {
+			gsoSize, err = getGSO(msg.OOB[:msg.NN])
+			if err != nil {
+				return n, err
 			}
-			copied := copy(msgs[n].Buffers[0], msg.Buffers[0][start:end])
-			msgs[n].N = copied
-			msgs[n].Addr = msg.Addr
-			start = end
-			end += gsoSize
-			if end > msg.N {
-				end = msg.N
+			if gsoSize > 0 {
+				numToSplit = (msg.N + gsoSize - 1) / gsoSize
+			}
+		}
+		addrPort := msg.Addr.(*net.UDPAddr).AddrPort()
+		ep := &StdNetEndpoint{AddrPort: addrPort} // TODO: remove allocation
+		getSrcFromControl(msg.OOB[:msg.NN], ep)
+		regionOffset := i * slabOffset // region may contain multiple coalesced packets
+		for j := 0; j < numToSplit; j++ {
+			if n >= len(packets) {
+				return n, fmt.Errorf("%w: filling received packet metadata resulted in overflow", io.ErrShortBuffer)
+			}
+			end := msg.N
+			if gsoSize > 0 && start+gsoSize < end {
+				end = start + gsoSize
+			}
+			packets[n] = ReceivedPacket{
+				Offset:   regionOffset + start,
+				Size:     end - start,
+				Endpoint: ep,
 			}
 			n++
-		}
-		if i != n-1 {
-			// It is legal for bytes to move within msg.Buffers[0] as a result
-			// of splitting, so we only zero the source msg len when it is not
-			// the destination of the last split operation above.
-			msg.N = 0
+			start = end
 		}
 	}
 	return n, nil

@@ -77,7 +77,7 @@ type WinRingBind struct {
 	isOpen atomic.Uint32 // 0, 1, or 2
 }
 
-func NewDefaultBind() Bind { return NewWinRingBind() }
+func NewDefaultBind(_ ...Option) Bind { return NewWinRingBind() }
 
 func NewWinRingBind() Bind {
 	if !winrio.Initialize() {
@@ -416,21 +416,25 @@ retry:
 	return n, &ep, nil
 }
 
-func (bind *WinRingBind) receiveIPv4(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv4(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v4.Receive(bufs[0], &bind.isOpen)
-	sizes[0] = n
-	eps[0] = ep
+	n, ep, err := bind.v4.Receive(slab, &bind.isOpen)
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
-func (bind *WinRingBind) receiveIPv6(bufs [][]byte, sizes []int, eps []Endpoint) (int, error) {
+func (bind *WinRingBind) receiveIPv6(slab []byte, packets []ReceivedPacket) (int, error) {
 	bind.mu.RLock()
 	defer bind.mu.RUnlock()
-	n, ep, err := bind.v6.Receive(bufs[0], &bind.isOpen)
-	sizes[0] = n
-	eps[0] = ep
+	n, ep, err := bind.v6.Receive(slab, &bind.isOpen)
+	packets[0] = ReceivedPacket{
+		Size:     n,
+		Endpoint: ep,
+	}
 	return 1, err
 }
 
@@ -518,7 +522,11 @@ func (bind *WinRingBind) Send(bufs [][]byte, endpoint Endpoint, offset int) erro
 func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv4.SyscallConn()
+	conn, err := firstConn(s.v4)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
@@ -538,7 +546,11 @@ func (s *StdNetBind) BindSocketToInterface4(interfaceIndex uint32, blackhole boo
 func (s *StdNetBind) BindSocketToInterface6(interfaceIndex uint32, blackhole bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sysconn, err := s.ipv6.SyscallConn()
+	conn, err := firstConn(s.v6)
+	if err != nil {
+		return err
+	}
+	sysconn, err := conn.SyscallConn()
 	if err != nil {
 		return err
 	}
